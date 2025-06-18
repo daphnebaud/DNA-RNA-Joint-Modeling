@@ -1,0 +1,54 @@
+name: Create Branch and PR from Issue
+
+on:
+  issues:
+    types: [opened, assigned] # Trigger when an issue is opened or assigned
+
+jobs:
+  create_branch_and_pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to create branches and push commits
+      pull-requests: write # Required to create pull requests
+
+    steps:
+      - name: Checkout develop branch
+        uses: actions/checkout@v4
+        with:
+          ref: develop # Specify the base branch to checkout
+
+      - name: Get issue details
+        id: issue
+        run: |
+          ISSUE_TITLE="${{ github.event.issue.title }}"
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          # Sanitize title for branch name (replace spaces with hyphens, remove special chars, lowercase)
+          BRANCH_NAME="feature/${ISSUE_NUMBER}-${ISSUE_TITLE//[^a-zA-Z0-9]/_}"
+          BRANCH_NAME=$(echo "$BRANCH_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/__*/-/g' | sed 's/^-*//' | sed 's/-*$//')
+          echo "Generated Branch Name: $BRANCH_NAME"
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+
+      - name: Create branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b ${{ steps.issue.outputs.branch_name }} develop
+          git push origin ${{ steps.issue.outputs.branch_name }}
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "feat: Start work on issue #${{ github.event.issue.number }}"
+          title: "feat: ${{ github.event.issue.title }} (#${{ github.event.issue.number }})"
+          body: |
+            This pull request starts work on issue #${{ github.event.issue.number }}.
+
+            **Related Issue:** #${{ github.event.issue.number }}
+            **Issue Title:** ${{ github.event.issue.title }}
+          base: develop # The branch to merge into (your develop branch)
+          head: ${{ steps.issue.outputs.branch_name }} # The newly created branch
+          draft: true # Optional: Create as a draft PR
+          labels: |
+            in progress # Add an "in progress" label to the PR
+            feature # Or bug, etc., based on issue labels if you want to pass them
