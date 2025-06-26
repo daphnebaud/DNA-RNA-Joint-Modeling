@@ -131,7 +131,7 @@ class DNASequenceClassifier(nn.Module):
         super(DNASequenceClassifier, self).__init__()
 
         # Input projection from one-hot features to d_model dimension
-        # Your one-hot encoded sequence is (batch_size, seq_len, num_nucleotides=5)
+        # Our one-hot encoded sequence is (batch_size, seq_len, num_nucleotides=5)
         # We need to project num_nucleotides to d_model
         self.input_projection = nn.Linear(input_features, d_model)
         self.positional_encoding = PositionalEncoding(d_model, max_seq_length)
@@ -157,9 +157,9 @@ class DNASequenceClassifier(nn.Module):
         Returns:
             torch.Tensor: Logits for binary classification (shape: batch_size, 1).
         """
-        # Create a padding mask if your sequences can have variable lengths
+        # Create a padding mask if our sequences can have variable lengths
         # For fixed window_size, this mask might not be strictly necessary if all inputs are full.
-        # If padding will be used, adapt this:
+        # If padding will be used, we can adapt this:
         # src_mask = (src.sum(dim=-1) != 0).unsqueeze(1).unsqueeze(2) # Assumes 0 sum for padded one-hot vectors
         # For now, let's assume fixed length or no padding mask needed
         src_mask = None # For simplicity, assuming no padding or constant window size
@@ -168,7 +168,7 @@ class DNASequenceClassifier(nn.Module):
         src_embedded = self.dropout(self.positional_encoding(self.input_projection(src)))
 
         enc_output = src_embedded
-        # Store attention probabilities if you want to analyze them
+        # Store attention probabilities if we want to analyze them later
         all_attn_probs = []
         for enc_layer in self.encoder_layers:
             enc_output, attn_probs = enc_layer(enc_output, src_mask)
