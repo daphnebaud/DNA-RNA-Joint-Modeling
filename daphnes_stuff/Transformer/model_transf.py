@@ -17,11 +17,17 @@ class MultiHeadAttention(nn.Module):
         self.d_k = d_model // num_heads  # Dimension of each head's key, query, and value
 
         # Linear layers for transforming inputs
+        #Let the model learn different roles for the same input (query, key, value).
+        #Enable multi-head attention (each head gets its own set of projections).
+        #Query: what am I looking for?
+        #Key: What do I have?
+        #
         self.W_q = nn.Linear(d_model, d_model)  # Query transformation
         self.W_k = nn.Linear(d_model, d_model)  # Key transformation
         self.W_v = nn.Linear(d_model, d_model)  # Value transformation
         self.W_o = nn.Linear(d_model, d_model)  # Output transformation
 
+    #Compute similarity scores → scale → apply mask → softmax → weighted sum of values
     def scaled_dot_product_attention(self, Q, K, V, mask=None):
         # Calculate attention scores
         attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
@@ -75,15 +81,20 @@ class PositionWiseFeedForward(nn.Module):
 
 # Positional Encoding is used to inject the position information of each token in the input sequence.
 # It uses sine and cosine functions of different frequencies to generate the positional encoding.
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_seq_length):
         super(PositionalEncoding, self).__init__()
 
         pe = torch.zeros(max_seq_length, d_model)
         position = torch.arange(0, max_seq_length, dtype=torch.float).unsqueeze(1)
+        # Compute the denominator term for the sinusoidal functions
+        # Uses exponentially increasing wavelengths
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))
 
+        # Apply sine to even-indexed dimensions (0, 2, 4, ...)
         pe[:, 0::2] = torch.sin(position * div_term)
+        # Apply cosine to odd-indexed dimensions (1, 3, 5, ...)
         pe[:, 1::2] = torch.cos(position * div_term)
 
         self.register_buffer('pe', pe.unsqueeze(0))
@@ -177,13 +188,9 @@ class DNASequenceClassifier(nn.Module):
         # --- Aggregation for Classification ---
         # Option 1: Global Average Pooling (common for sequence classification)
         # Averages the representations across the sequence length dimension
+
+        #after last encoder layer enc_output has shape (batch_size, seq_length, d_model)
         pooled_output = enc_output.mean(dim=1) # Shape: (batch_size, d_model)
-
-        # Option 2: Use the representation of the first token (if you add a [CLS] token like in BERT)
-        # pooled_output = enc_output[:, 0, :]
-
-        # Option 3: Max Pooling
-        # pooled_output = enc_output.max(dim=1)[0]
 
 
         # Pass the pooled representation through the classification head
