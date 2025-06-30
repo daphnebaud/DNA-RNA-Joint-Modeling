@@ -1,0 +1,718 @@
+import torch
+import torch.nn as nn
+import math
+import copy
+# from torch.utils.data import DataLoader, Subset, random_split # These imports are not strictly needed in this model file
+
+# The multi-head attention mechanism computes the attention between each pair of positions in a sequence.
+# It consists of multiple “attention heads” that capture different aspects of the input sequence.
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        # Ensure that the model dimension (d_model) is divisible by the number of heads
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
+        # Initialize dimensions
+        self.d_model = d_model  # Model's dimension
+        self.num_heads = num_heads  # Number of attention heads
+        self.d_k = d_model // num_heads  # Dimension of each head's key, query, and value
+
+        # Linear layers for transforming inputs
+        #Let the model learn different roles for the same input (query, key, value).
+        #Enable multi-head attention (each head gets its own set of projections).
+        #Query: what am I looking for?
+        #Key: What information it contains?
+        #Value: Content
+        self.W_q = nn.Linear(d_model, d_model)  # Query transformation
+        self.W_k = nn.Linear(d_model, d_model)  # Key transformation
+        self.W_v = nn.Linear(d_model, d_model)  # Value transformation
+        self.W_o = nn.Linear(d_model, d_model)  # Output transformation
+
+    #Compute similarity scores → scale → apply mask → softmax → weighted sum of values
+    def scaled_dot_product_attention(self, Q, K, V, mask=None):
+        # Calculate attention scores
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_k)
+
+        # Apply mask if provided (useful for preventing attention to certain parts like padding)
+        if mask is not None:
+            # For causal masking (like in decoders), mask == 0 would be -inf
+            # For encoder padding mask, mask == 0 indicates padding.
+            attn_scores = attn_scores.masked_fill(mask == 0, -1e9)
+
+        # Softmax is applied to obtain attention probabilities
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+
+        # Multiply by values to obtain the final output
+        output = torch.matmul(attn_probs, V)
+        return output, attn_probs # Also return attention probabilities if needed for visualization/interpretability
+
+    def split_heads(self, x):
+        # Reshape the input to have num_heads for multi-head attention
+        batch_size, seq_length, d_model = x.size()
+        return x.view(batch_size, seq_length, self.num_heads, self.d_k).transpose(1, 2)
+
+    def combine_heads(self, x):
+        # Combine the multiple heads back to original shape
+        batch_size, _, seq_length, d_k = x.size()
+        return x.transpose(1, 2).contiguous().view(batch_size, seq_length, self.d_model)
+
+    def forward(self, Q, K, V, mask=None):
+        # Apply linear transformations and split heads
+        Q = self.split_heads(self.W_q(Q))
+        K = self.split_heads(self.W_k(K))
+        V = self.split_heads(self.W_v(V))
+
+        # Perform scaled dot-product attention
+        attn_output, attn_probs = self.scaled_dot_product_attention(Q, K, V, mask)
+
+        # Combine heads and apply output transformation
+        output = self.W_o(self.combine_heads(attn_output))
+        return output, attn_probs # Return output and attention probabilities
+
+
+class PositionWiseFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super(PositionWiseFeedForward, self).__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        return self.fc2(self.relu(self.fc1(x)))
+
+# Positional Encoding is used to inject the position information of each token in the input sequence.
+# It uses sine and cosine functions of different frequencies to generate the positional encoding.
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_seq_length):
+        super(PositionalEncoding, self).__init__()
+
+        pe = torch.zeros(max_seq_length, d_model)
+        position = torch.arange(0, max_seq_length, dtype=torch.float).unsqueeze(1)
+        # Compute the denominator term for the sinusoidal functions
+        # Uses exponentially increasing wavelengths
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))
+
+        # Apply sine to even-indexed dimensions (0, 2, 4, ...)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        # Apply cosine to odd-indexed dimensions (1, 3, 5, ...)
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+
+# The EncoderLayer class defines a single layer of the transformer's encoder
+# multi-head self-attention mechanism -> position-wise feed-forward neural network, with residual connections, layer normalization, and dropout applied as appropriate
+# Together, these components allow the encoder to capture complex relationships in the input data and transform them into a useful representation for downstream tasks
+# Typically, multiple such encoder layers are stacked to form the complete encoder part of a transformer model.
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff, dropout):
+        super(EncoderLayer, self).__init__()
+        self.self_attn = MultiHeadAttention(d_model, num_heads)
+        self.feed_forward = PositionWiseFeedForward(d_model, d_ff)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask):
+        attn_output, attn_probs = self.self_attn(x, x, x, mask)
+        x = self.norm1(x + self.dropout(attn_output))
+        ff_output = self.feed_forward(x)
+        x = self.norm2(x + self.dropout(ff_output))
+        return x, attn_probs # Return attention probabilities for potential analysis
+
+
+# The DNASequenceClassifier (a modified Transformer Encoder) for masked expression prediction
+class DNASequenceClassifier(nn.Module):
+    def __init__(self, input_features, d_model, num_heads, num_layers, d_ff, max_seq_length, dropout):
+        """
+        Initializes the DNASequenceClassifier for a masked expression prediction task.
+
+        Args:
+            input_features (int): Number of input features per position (e.g., 5 for one-hot A,C,G,T,N + 1 for expression state).
+            d_model (int): Dimension of the model's embeddings.
+            num_heads (int): Number of attention heads.
+            num_layers (int): Number of encoder layers.
+            d_ff (int): Dimension of the feed-forward network.
+            max_seq_length (int): Maximum sequence length for positional encoding.
+            dropout (float): Dropout rate.
+        """
+        super(DNASequenceClassifier, self).__init__()
+
+        # Input projection from (input_features) to d_model dimension
+        # input_features will now be NUM_NUCLEOTIDES (5) + 1 (for expression state) = 6
+        self.input_projection = nn.Linear(input_features, d_model)
+        self.positional_encoding = PositionalEncoding(d_model, max_seq_length)
+        self.dropout = nn.Dropout(dropout)
+        self.d_model = d_model # Ensure d_model is saved as an attribute
+
+        self.encoder_layers = nn.ModuleList(
+            [EncoderLayer(d_model, num_heads, d_ff, dropout) for _ in range(num_layers)])
+
+        # Prediction head for per-position binary output (expressed/not expressed)
+        # This will operate on the encoder's output for each position.
+        self.prediction_head = nn.Linear(d_model, 1) # Outputs a single logit per position
+
+
+    def forward(self, src):
+        """
+        Forward pass for the DNA Sequence Classifier in masked expression mode.
+
+        Args:
+            src (torch.Tensor): Input sequence tensor.
+                                Expected shape: (batch_size, sequence_length, input_features)
+                                (e.g., batch_size, window_size, NUM_NUCLEOTIDES + 1)
+        Returns:
+            torch.Tensor: Logits for binary classification for each position (shape: batch_size, sequence_length, 1).
+        """
+        src_mask = None # Assuming no explicit padding mask needed if window_size is fixed
+
+        # Project input features to d_model and add positional encoding
+        # Apply scaling by sqrt(d_model) before positional encoding
+        src_embedded = self.input_projection(src) * math.sqrt(self.d_model)
+        src_embedded = self.dropout(self.positional_encoding(src_embedded))
+
+        enc_output = src_embedded
+        # Store attention probabilities if we want to analyze them later
+        all_attn_probs = []
+        for enc_layer in self.encoder_layers:
+            enc_output, attn_probs = enc_layer(enc_output, src_mask)
+            all_attn_probs.append(attn_probs)
+
+        # --- Per-position prediction ---
+        # The encoder output is (batch_size, seq_length, d_model)
+        # Apply the prediction head to get (batch_size, seq_length, 1)
+        logits = self.prediction_head(enc_output)
+
+        return logits # We return logits (raw scores) for BCEWithLogitsLoss
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, random_split, Subset, Dataset  # Import Dataset for custom class
+import matplotlib.pyplot as plt
+import os
+import numpy as np
+import pandas as pd
+# from torch.utils.data import Dataset # Already imported above
+# Import torch.cuda.amp for Automatic Mixed Precision
+from torch.cuda.amp import autocast, GradScaler
+import math  # Make sure math is imported for sqrt
+import random  # For random masking span
+
+# --- NEW GLOBAL CONSTANT FOR MASKING ---
+# This value will be used in the input to denote a masked expression label.
+# It should be a value that the model can differentiate from 0.0 or 1.0.
+# Since labels are float32, 0.5 is a good neutral value.
+MASK_EXPRESSION_VALUE = 0.5
+
+
+# ---Data Loader Code ---
+
+def get_data_dir():
+    """
+    Determines the correct data directory based on the execution environment.
+    This function makes the code portable between Colab, local PyCharm, and cluster.
+    """
+    local_or_cluster_project_path = os.getcwd()
+    data_directory = os.path.join(local_or_cluster_project_path, 'data/')
+
+    try:
+        from google.colab import drive
+        drive.mount('/content/gdrive')
+        google_drive_project_path = '/content/gdrive/MyDrive/DnARnAProject/'
+        data_directory = os.path.join(google_drive_project_path, 'data/')
+        print("Detected Google Colab environment. Using Google Drive path.")
+    except ImportError:
+        print("Not in Google Colab. Using local/cluster path.")
+
+    if not os.path.isdir(data_directory):
+        raise FileNotFoundError(f"Error: The data directory '{data_directory}' does not exist. "
+                                f"Please ensure your data is located correctly for your environment.")
+    return data_directory
+
+
+class GenomeExpressionDataset(Dataset):
+    """
+    Custom Dataset for loading DNA sequence and expression data for genomic regions.
+    It loads data from pre-processed .npz and .parquet files.
+    Handles reverse complement for '-' strand sequences and uses appropriate expression labels.
+    """
+
+    def __init__(self, data_dir):
+        """
+        Initializes the dataset by loading the full sequence and expression arrays
+        and the DataFrame of genomic regions.
+
+        Args:
+            data_dir (str): The path to the directory containing 'data.npz' and 'regions.parquet'.
+        """
+        self.data_dir = data_dir
+
+        self.data_npz_path = os.path.join(data_dir, 'data.npz')
+        self.regions_parquet_path = os.path.join(data_dir, 'regions.parquet')
+
+        try:
+            self.data_npz = np.load(self.data_npz_path, allow_pickle=True)
+            self.sequence_data = self.data_npz['sequence']
+            self.expression_plus_data = self.data_npz['expressed_plus']
+            self.expression_minus_data = self.data_npz['expressed_minus']
+            self.data_npz.close()
+        except KeyError as e:
+            available_keys = list(np.load(self.data_npz_path).keys()) if os.path.exists(
+                self.data_npz_path) else "File not found during key check."
+            raise RuntimeError(f"KeyError: Key '{e}' not found in {self.data_npz_path}. "
+                               f"Available keys: {available_keys}. "
+                               f"Please check your .npz file structure.")
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not load data from {self.data_npz_path}. Make sure the file exists and is not corrupted: {e}")
+
+        try:
+            self.regions_df = pd.read_parquet(self.regions_parquet_path)
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not load regions from {self.regions_parquet_path}. Make sure the file exists and is not corrupted: {e}")
+
+        self.num_nucleotides = 5  # A, C, G, T, N (mapped to 0, 1, 2, 3, 4)
+        self.complement_map = np.array([3, 2, 1, 0, 4], dtype=np.uint8)
+
+    def __len__(self):
+        return len(self.regions_df)
+
+    def _one_hot_encode(self, sequence_segment):
+        """
+        Converts a sequence segment (array of integer encodings) into a one-hot encoded tensor.
+        """
+        one_hot_tensor = torch.zeros(len(sequence_segment), self.num_nucleotides, dtype=torch.float32)
+        one_hot_tensor.scatter_(1, torch.tensor(sequence_segment).unsqueeze(1).long(), 1)
+        return one_hot_tensor
+
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+
+        region_info = self.regions_df.iloc[idx]
+
+        offset = region_info['offset']
+        window_size = region_info['window_size']
+        strand = region_info['strand']
+
+        sequence_segment = self.sequence_data[offset: offset + window_size].copy()
+
+        if strand == '+':
+            encoded_sequence = self._one_hot_encode(sequence_segment)
+            expression_label_segment = self.expression_plus_data[offset: offset + window_size].copy()
+        else:  # strand == '-'
+            reverse_complemented_sequence = self.complement_map[sequence_segment][::-1].copy()
+            encoded_sequence = self._one_hot_encode(reverse_complemented_sequence)
+            expression_label_segment = self.expression_minus_data[offset: offset + window_size].copy()
+
+        # Ensure expression_label_segment is a float32 tensor
+        expression_label_segment = torch.tensor(expression_label_segment, dtype=torch.float32)
+
+        return encoded_sequence, expression_label_segment
+
+
+# --- NEW: Masked Dataset Wrapper ---
+class MaskedGenomeExpressionDataset(Dataset):
+    """
+    Wraps GenomeExpressionDataset to apply contiguous masking to expression labels
+    for a Masked Expression Prediction (MEP) task.
+    """
+
+    def __init__(self, base_dataset: GenomeExpressionDataset, mask_fraction=0.5):
+        self.base_dataset = base_dataset
+        self.mask_fraction = mask_fraction
+
+        # Get sequence length from base dataset's first item (assuming fixed length)
+        # This will be used to calculate the masking span length
+        if len(self.base_dataset) > 0:
+            sample_seq, _ = self.base_dataset[0]
+            self.seq_length = sample_seq.shape[0]
+        else:
+            self.seq_length = 2048  # Fallback, but should be detected from data
+
+        self.num_nucleotides = self.base_dataset.num_nucleotides
+        self.mask_expression_value = MASK_EXPRESSION_VALUE  # Use the global constant
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        # Retrieve original sequence and expression labels
+        nucleotide_sequence, original_expression_labels = self.base_dataset[idx]  # (seq_len, num_nuc), (seq_len,)
+
+        # Create input_expression_states by copying original labels
+        input_expression_states = original_expression_labels.clone().unsqueeze(-1)  # (seq_len, 1)
+
+        # Determine the length of the span to mask
+        mask_span_length = max(1, int(self.seq_length * self.mask_fraction))
+
+        # Randomly choose a start index for the contiguous mask span
+        if self.seq_length - mask_span_length > 0:
+            mask_start_idx = random.randint(0, self.seq_length - mask_span_length)
+        else:  # If sequence is too short or mask_fraction is too high
+            mask_start_idx = 0
+            mask_span_length = self.seq_length  # Mask the whole thing if span is >= seq_length
+
+        mask_end_idx = mask_start_idx + mask_span_length
+
+        # Create a boolean mask for the target (what positions need to be predicted)
+        target_mask = torch.zeros(self.seq_length, dtype=torch.bool)
+        target_mask[mask_start_idx: mask_end_idx] = True
+
+        # Apply masking to the input_expression_states
+        input_expression_states[mask_start_idx: mask_end_idx] = self.mask_expression_value
+
+        # Concatenate nucleotide sequence with the potentially masked expression states
+        # Resulting shape: (seq_length, num_nucleotides + 1)
+        model_input = torch.cat((nucleotide_sequence, input_expression_states), dim=-1)
+
+        # Return: (model_input, original_expression_labels, target_mask)
+        # model_input: (seq_len, NUM_NUCLEOTIDES + 1) with masked expression values in the masked span
+        # original_expression_labels: (seq_len,) the true labels for all positions
+        # target_mask: (seq_len,) boolean mask, True for positions that were masked in input_expression_states
+        return model_input, original_expression_labels, target_mask
+
+
+# --- End of Data Loader Code ---
+
+
+# --- Hyperparameters for your DNA Sequence Classifier ---
+NUM_NUCLEOTIDES = 5  # A, C, G, T, N (from your data loader)
+# *** CHANGE: Input features now include expression state ***
+NEW_INPUT_FEATURES = NUM_NUCLEOTIDES + 1  # 5 + 1 = 6
+
+D_MODEL = 64
+NUM_HEADS = 4
+NUM_LAYERS = 3
+D_FF = 256
+MAX_SEQ_LENGTH = 2048  # Will be updated dynamically based on data's window_size
+DROPOUT = 0.1
+
+BATCH_SIZE = 8
+LEARNING_RATE = 0.0001
+NUM_EPOCHS = 50
+
+# --- Parameters for Debugging/Subset Training ---
+DEBUG_DATASET_SIZE = 10000  # Set to None for full dataset
+
+# --- Gradient Accumulation Steps ---
+GRADIENT_ACCUMULATION_STEPS = 4
+
+# --- Learning Rate Warmup Steps ---
+WARMUP_STEPS = 2000
+
+# --- Device Configuration ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# --- Initialize Dataset and DataLoader ---
+data_dir = get_data_dir()
+base_full_dataset = GenomeExpressionDataset(data_dir)  # Original dataset
+
+if len(base_full_dataset) > 0:
+    # Get sequence length from base dataset's first item (assuming fixed length)
+    sample_seq, sample_labels = base_full_dataset[0]
+    MAX_SEQ_LENGTH = sample_seq.shape[0]  # sequence_length (window_size)
+    print(f"Detected sequence length (window_size): {MAX_SEQ_LENGTH}")
+    # Pass seq_length to MaskedGenomeExpressionDataset if it wasn't already determined
+    # Or, if MaskedGenomeExpressionDataset infers it, ensure it's correct.
+    # The MaskedGenomeExpressionDataset now computes its own seq_length from base_dataset
+else:
+    print("Warning: Dataset is empty, cannot determine MAX_SEQ_LENGTH dynamically. Using default.")
+
+# *** CHANGE: Wrap the full_dataset with MaskedGenomeExpressionDataset ***
+full_dataset_for_task = MaskedGenomeExpressionDataset(base_full_dataset, mask_fraction=0.5)
+
+# Dataset Split: Train, Validation, Test
+if DEBUG_DATASET_SIZE is not None and DEBUG_DATASET_SIZE < len(full_dataset_for_task):
+    print(f"DEBUG MODE: Creating a subset of size {DEBUG_DATASET_SIZE} from the full dataset.")
+    indices = torch.randperm(len(full_dataset_for_task)).tolist()[:DEBUG_DATASET_SIZE]
+    dataset_to_split = Subset(full_dataset_for_task, indices)
+    total_size = len(dataset_to_split)
+else:
+    print("Using the full dataset.")
+    dataset_to_split = full_dataset_for_task
+    total_size = len(full_dataset_for_task)
+
+train_ratio = 0.8
+val_ratio = 0.1
+test_ratio = 0.1
+
+train_size = int(train_ratio * total_size)
+val_size = int(val_ratio * total_size)
+test_size = total_size - train_size - val_size
+
+train_dataset, val_dataset, test_dataset = random_split(dataset_to_split, [train_size, val_size, test_size])
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+print(f"Dataset split: Train={len(train_dataset)}, Validation={len(val_dataset)}, Test={len(test_dataset)}")
+
+# --- Initialize Model, Loss, and Optimizer ---
+model = DNASequenceClassifier(
+    input_features=NEW_INPUT_FEATURES,  # *** CHANGE: Use new input_features ***
+    d_model=D_MODEL,
+    num_heads=NUM_HEADS,
+    num_layers=NUM_LAYERS,
+    d_ff=D_FF,
+    max_seq_length=MAX_SEQ_LENGTH,
+    dropout=DROPOUT
+).to(device)
+
+criterion = nn.BCEWithLogitsLoss(reduction='none')  # *** CHANGE: Use reduction='none' for per-sample loss ***
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, betas=(0.9, 0.98), eps=1e-9)
+
+scaler = torch.amp.GradScaler('cuda')
+
+
+def lr_lambda(current_step: int):
+    if current_step < WARMUP_STEPS:
+        return float(current_step) / float(max(1, WARMUP_STEPS))
+    return 1.0
+
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+# --- Lists to store metrics for plotting ---
+train_losses = []
+val_losses = []
+train_accuracies = []
+val_accuracies = []
+
+# --- Training Loop ---
+print("\nStarting training...")
+global_optimizer_step = 0  # To track total optimizer steps for the LR scheduler
+for epoch in range(NUM_EPOCHS):
+    model.train()
+    total_loss = 0
+    correct_predictions = 0
+    total_relevant_samples = 0  # Count only masked positions for accuracy
+
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+    for batch_idx, (sequences, true_labels, target_masks) in enumerate(
+            train_loader):  # *** CHANGE: New return from DataLoader ***
+
+        sequences = sequences.to(device)
+        true_labels = true_labels.to(device).unsqueeze(-1)  # (batch_size, seq_length, 1)
+        target_masks = target_masks.to(device)  # (batch_size, seq_length)
+
+        # --- IMPORTANT: Zero gradients at the beginning of each accumulation step ---
+        # This is more robust when dealing with conditional optimizer.zero_grad()
+        if batch_idx % GRADIENT_ACCUMULATION_STEPS == 0:
+            optimizer.zero_grad()
+
+        with torch.amp.autocast('cuda'):
+            logits = model(sequences)  # (batch_size, seq_length, 1)
+
+            # *** CHANGE: Calculate loss only on masked positions ***
+            # Flatten logits, true_labels, and masks for easy indexing
+            logits_flat = logits.view(-1)
+            true_labels_flat = true_labels.view(-1)
+            target_masks_flat = target_masks.view(-1)
+
+            # Select only the elements corresponding to the masked positions
+            masked_logits = logits_flat[target_masks_flat]
+            masked_true_labels = true_labels_flat[target_masks_flat]
+            # Inside your training loop, within the `for batch_idx, ...` loop,
+            # right before the `if masked_logits.numel() == 0:` block:
+
+            # Add these lines for debugging:
+            if batch_idx < 5:  # Only print for the first few batches to avoid excessive output
+                print(f"DEBUG: Batch {batch_idx + 1}")
+                print(f"  Shape of true_labels (from DataLoader): {true_labels.shape}")
+                print(f"  Unique values in true_labels (from DataLoader): {true_labels.unique()}")
+                print(f"  Shape of target_masks: {target_masks.shape}")
+                print(f"  Number of True in target_masks: {target_masks.sum().item()}")
+
+                print(f"  Shape of masked_logits: {masked_logits.shape}")
+                print(f"  Unique values in masked_true_labels (target for loss): {masked_true_labels.unique()}")
+                print(f"  dtype of masked_true_labels: {masked_true_labels.dtype}")
+
+                # Calculate a sample loss without scaling or mean for direct inspection
+                if masked_logits.numel() > 0:
+                    sample_loss_raw = criterion(masked_logits, masked_true_labels)
+                    print(f"  Sample raw loss (first 5 values): {sample_loss_raw[:5]}")
+                    print(f"  Mean of sample raw loss: {sample_loss_raw.mean().item():.6f}")
+                else:
+                    print("  No masked positions in this batch for loss calculation.")
+            # If no masked positions in a batch, skip loss calculation
+            if masked_logits.numel() == 0:
+                loss = torch.tensor(0.0, device=device)
+            else:
+                loss = criterion(masked_logits, masked_true_labels)
+                loss = loss.mean()  # Take the mean of the 'none' reduction loss
+                loss = loss / GRADIENT_ACCUMULATION_STEPS  # Apply loss scaling for gradient accumulation
+
+        # Scale the loss and call backward()
+        scaler.scale(loss).backward()
+
+        if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+            scaler.step(optimizer)
+            scaler.update()
+            # optimizer.zero_grad() # Already done at the start of accumulation cycle
+            scheduler.step()  # Update learning rate
+            global_optimizer_step += 1
+
+        # *** CHANGE: Adjust total_loss and accuracy calculation for masked task ***
+        # total_loss tracks the actual loss magnitude, not scaled.
+        # If masked_logits.numel() was 0, loss.item() would be 0, so no division needed.
+        if masked_logits.numel() > 0:
+            total_loss += loss.item() * GRADIENT_ACCUMULATION_STEPS  # Undo scaling
+
+            # Calculate accuracy only for masked positions
+            predictions = (torch.sigmoid(masked_logits) > 0.5).float()
+            val_correct_predictions = (predictions == masked_true_labels).sum().item()
+            correct_predictions += val_correct_predictions
+            total_relevant_samples += masked_true_labels.size(0)  # Count actual masked samples
+
+        if (batch_idx + 1) % 100 == 0:
+            avg_loss_so_far = total_loss / (
+                total_relevant_samples if total_relevant_samples > 0 else 1)  # Use total_relevant_samples for loss averaging too
+            avg_acc_so_far = correct_predictions / (total_relevant_samples if total_relevant_samples > 0 else 1)
+            current_lr = optimizer.param_groups[0]['lr']
+            print(
+                f"  Batch {batch_idx + 1}/{len(train_loader)}, Loss: {avg_loss_so_far:.4f}, Accuracy: {avg_acc_so_far:.4f}, LR: {current_lr:.6f}")
+
+    # Ensure final step if batches don't perfectly divide accumulation steps
+    if (batch_idx + 1) % GRADIENT_ACCUMULATION_STEPS != 0:
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
+        scheduler.step()
+        global_optimizer_step += 1
+
+    # Calculate epoch-level metrics based on total_relevant_samples
+    avg_train_loss = total_loss / (total_relevant_samples if total_relevant_samples > 0 else 1)
+    train_accuracy = correct_predictions / (total_relevant_samples if total_relevant_samples > 0 else 1)
+    train_losses.append(avg_train_loss)
+    train_accuracies.append(train_accuracy)
+
+    print(f"Epoch {epoch + 1}/{NUM_EPOCHS}:")
+    print(f"  Train Loss: {avg_train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}")
+
+    # --- Validation Loop ---
+    model.eval()
+    val_loss = 0
+    val_correct_predictions = 0
+    val_total_relevant_samples = 0
+    with torch.no_grad():
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        for sequences, true_labels, target_masks in val_loader:  # *** CHANGE: New return from DataLoader ***
+            sequences = sequences.to(device)
+            true_labels = true_labels.to(device).unsqueeze(-1)
+            target_masks = target_masks.to(device)
+
+            with atorch.amp.autocast('cuda'):
+                logits = model(sequences)
+
+                # *** CHANGE: Calculate loss only on masked positions ***
+                logits_flat = logits.view(-1)
+                true_labels_flat = true_labels.view(-1)
+                target_masks_flat = target_masks.view(-1)
+
+                masked_logits = logits_flat[target_masks_flat]
+                masked_true_labels = true_labels_flat[target_masks_flat]
+
+                if masked_logits.numel() == 0:
+                    loss = torch.tensor(0.0, device=device)
+                else:
+                    loss = criterion(masked_logits, masked_true_labels)
+                    loss = loss.mean()
+
+            val_loss += loss.item()
+
+            if masked_logits.numel() > 0:
+                predictions = (torch.sigmoid(masked_logits) > 0.5).float()
+                val_correct_predictions += (predictions == masked_true_labels).sum().item()
+                val_total_relevant_samples += masked_true_labels.size(0)
+
+    avg_val_loss = val_loss / (len(val_loader) if len(val_loader) > 0 else 1)  # Keep avg loss per batch for validation
+    val_accuracy = val_correct_predictions / (val_total_relevant_samples if val_total_relevant_samples > 0 else 1)
+    val_losses.append(avg_val_loss)
+    val_accuracies.append(val_accuracy)
+
+    print(f"  Validation Loss: {avg_val_loss:.4f}, Validation Accuracy: {val_accuracy:.4f}")
+
+print("\nTraining complete!")
+
+# --- Test Evaluation ---
+print("\nStarting test evaluation...")
+model.eval()
+test_loss = 0
+test_correct_predictions = 0
+test_total_relevant_samples = 0
+with torch.no_grad():
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    for sequences, true_labels, target_masks in test_loader:  # *** CHANGE: New return from DataLoader ***
+        sequences = sequences.to(device)
+        true_labels = true_labels.to(device).unsqueeze(-1)
+        target_masks = target_masks.to(device)
+
+        with torch.amp.autocast('cuda'):
+            logits = model(sequences)
+
+            # *** CHANGE: Calculate loss only on masked positions ***
+            logits_flat = logits.view(-1)
+            true_labels_flat = true_labels.view(-1)
+            target_masks_flat = target_masks.view(-1)
+
+            masked_logits = logits_flat[target_masks_flat]
+            masked_true_labels = true_labels_flat[target_masks_flat]
+
+            if masked_logits.numel() == 0:
+                loss = torch.tensor(0.0, device=device)
+            else:
+                loss = criterion(masked_logits, masked_true_labels)
+                loss = loss.mean()
+
+        test_loss += loss.item()
+
+        if masked_logits.numel() > 0:
+            predictions = (torch.sigmoid(masked_logits) > 0.5).float()
+            test_correct_predictions += (predictions == masked_true_labels).sum().item()
+            test_total_relevant_samples += masked_true_labels.size(0)
+
+avg_test_loss = test_loss / (len(test_loader) if len(test_loader) > 0 else 1)
+test_accuracy = test_correct_predictions / (test_total_relevant_samples if test_total_relevant_samples > 0 else 1)
+print(f"Test Loss: {avg_test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}")
+
+# --- Plotting Training and Validation Metrics ---
+epochs_range = range(1, NUM_EPOCHS + 1)
+
+plt.figure(figsize=(12, 5))
+
+# Plot Loss
+plt.subplot(1, 2, 1)
+plt.plot(epochs_range, train_losses, label='Training Loss')
+plt.plot(epochs_range, val_losses, label='Validation Loss')
+plt.title('Training and Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True)
+
+# Plot Accuracy
+plt.subplot(1, 2, 2)
+plt.plot(epochs_range, train_accuracies, label='Training Accuracy')
+plt.plot(epochs_range, val_accuracies, label='Validation Accuracy')
+plt.title('Training and Validation Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
