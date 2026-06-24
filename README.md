@@ -9,7 +9,7 @@ This project leverages deep learning to decipher the regulatory code driving gen
 
 ## 🧠 Architectures
 * **CNN (BPNet Variant):** A pooling-free, exponentially dilated residual network that preserves base-pair resolution to predict nucleotide identity and RNA expression.
-* **Transformer (Encoder-Only):** A 4-layer multi-head self-attention network designed to capture global, long-range dependencies across the combined DNA/RNA input vectors.
+* **Transformer (Encoder-Only):** A 4-layer multi-head self-attention network designed to capture global, long-range dependencies across the combined DNA/RNA input vectors. *(to be found in daphnes_stuff -> Transformer -> transformer_C.ipynb)*
 
 ## ⚙️ Training Methodology
 We use a self-supervised, cross-modal masking strategy to force the models to learn complex regulatory grammar:
